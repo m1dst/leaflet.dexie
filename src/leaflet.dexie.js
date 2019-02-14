@@ -172,20 +172,21 @@ var ControlSaveTiles = L.Control.extend( {
   
   setStorageSize: function (callback) {
     var self = this;
+	if (!this.dtable) return;
     this.dtable.count().then(function (numberOfKeys) {
       self.status.storagesize = numberOfKeys;
       self._baseLayer.fire('storagesize', self.status);
       if (callback) {
         callback(numberOfKeys);
       }
-    }, function (err) { callback(0); throw err; });
+	}, function (err) { if (callback) { callback(0); } throw err; });
   },
 
   _resetStatus: function (tiles) {
 	this.status.lengthLoaded = 0;
 	this.status.lengthToBeSaved = tiles.length;
 	this.status.lengthSaved = 0;
-	this.status._tilesforSave = tiles
+	this.status._tilesforSave = tiles;
   },
   
   _loadTile: async function(tblName) {		// recursively load all tiles for one subdomain
@@ -193,19 +194,26 @@ var ControlSaveTiles = L.Control.extend( {
 	var tileUrl = self.status._tilesforSave.shift();
 	
 	const blob = await fetch(tileUrl.url).then
-		((res) => { return(res.blob()) }).catch(err => console.log(err));
-	if (!blob) return;
-	if (self.status.lengthLoaded == 0) {
-		if (self.status.tnames.indexOf(tblName) < 0)	// create new table on 1st tile and save all tiles into it
-			await self._extendSchema("+"+tblName).catch(err => console.log(err));
-		else						//overwrite existing table
-			await self._db.table(tblName).clear().catch(err => console.log(err));
-		self.dtable = self._db.table(tblName);		// needed here by _saveTile
-		self.status.mapSize = 0;
+-       ((res) => { return res.blob(); }).catch(err => console.log(err));
+
+	if (blob) {
+		if (self.status.lengthLoaded === 0) {
+			if (self.status.tnames.indexOf(tblName) < 0)	// create new table on 1st tile and save all tiles into it
+				await self._extendSchema("+" + tblName).catch(err => console.log(err));
+			else						//overwrite existing table
+				await self._db.table(tblName).clear().catch(err => console.log(err));
+			self.dtable = self._db.table(tblName);		// needed here by _saveTile
+			self.status.mapSize = 0;
+		}
+		self._saveTile(tileUrl.key, blob);
+		self.status.mapSize += blob.size;
+		self.status.lengthLoaded++;
 	}
-	self._saveTile(tileUrl.key, blob);
-	self.status.mapSize += blob.size;
-	self.status.lengthLoaded++;
+	else {
+		console.log("Blob was not downloaded for some reason. Resubmitting " + tileUrl.url);
+		self.status._tilesforSave.push(tileUrl);
+	}
+
 	if (self.status._tilesforSave.length > 0) {
 		self._loadTile(tblName).catch(err => console.log(err));
 	} else {
@@ -216,17 +224,30 @@ var ControlSaveTiles = L.Control.extend( {
 	}
   },
 
-  _saveTile: function (tileUrl, blob) {
+  _saveTile: async function (tileUrl, blob) {
 	var self = this;
 	if (!this.dtable) return;
-	this.dtable.put(blob, tileUrl).then(() => {	// store the binary data
-		self.status.lengthSaved++;
-		self._baseLayer.fire('savetileend', self.status);
-		if (self.status.lengthSaved === self.status.lengthToBeSaved) {
-		  self._baseLayer.fire('tblevent', self.status);	// map saved
-		  self.setStorageSize();
+	
+		// iOS doesn't support blobs in indexeddb.  Convert to DataUrl.
+		//UnknownError: Error preparing Blob/File data to be stored in object store
+		this.dtable.put(blob, tileUrl)
+			.catch(async err => {
+				if (err.name === 'UnknownError') {
+					var dataUrl = await blobUtil.blobToDataURL(blob);
+					this.dtable.put(dataUrl, tileUrl).then();
+				} else {
+					throw err;
+				}
+			})
+			.then(() => {	// store the binary data
+				self.status.lengthSaved++;
+				self._baseLayer.fire('savetileend', self.status);
+				if (self.status.lengthSaved === self.status.lengthToBeSaved) {
+					self._baseLayer.fire('tblevent', self.status);	// map saved
+					self.setStorageSize();
+
 		}
-	}).catch(err => console.log(err)); 
+	});
   },
 
   _extendSchema: async function (tbl) {		// replace db schema in Dexie.js
@@ -310,6 +331,8 @@ var TileLayerOffline = L.TileLayer.extend( {
 	self.dtable.get(self._getStorageKey(url)).then(function (data) {
 		if (data && typeof data === 'object') {
 			resolve(URL.createObjectURL(data));
+		} else if (data && typeof data === 'string') {
+			resolve(data);
 		} else 
 			reject();
 	}).catch((e) => { reject(e); });   //console.log(e); 
